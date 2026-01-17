@@ -3,6 +3,11 @@ name: Reusable Go Deploy Workflow
 on:
   workflow_call:
     inputs:
+      service_name:
+        description: 'Service name for container (defaults to repo name)'
+        required: false
+        type: string
+        default: ''
       go_version:
         description: 'Go version to use'
         required: false
@@ -58,7 +63,7 @@ jobs:
   build-and-deploy:
     runs-on: ubuntu-latest
     env:
-      SERVICE_NAME: ${{ github.event.repository.name }}
+      SERVICE_NAME: ${{ inputs.service_name || github.event.repository.name }}
       APP_PORT: ${{ inputs.app_port }}
       GRPC_PORT: ${{ inputs.grpc_port }}
       ENV_FILE: ${{ inputs.env_file }}
