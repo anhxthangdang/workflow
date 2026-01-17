@@ -1,0 +1,198 @@
+name: Reusable Go Deploy Workflow
+
+on:
+  workflow_call:
+    inputs:
+      go_version:
+        description: 'Go version to use'
+        required: false
+        type: string
+        default: '1.23'
+      app_port:
+        description: 'Application port (HTTP)'
+        required: false
+        type: string
+        default: '8080'
+      grpc_port:
+        description: 'gRPC port (optional)'
+        required: false
+        type: string
+        default: ''
+      env_file:
+        description: 'Environment file path on server'
+        required: false
+        type: string
+        default: ''
+      additional_volumes:
+        description: 'Additional volume mounts (space-separated, e.g., "-v /host/path1:/container/path1")'
+        required: false
+        type: string
+        default: ''
+      docker_network:
+        description: 'Docker network name'
+        required: false
+        type: string
+        default: ''
+      health_endpoint:
+        description: 'Health check endpoint path'
+        required: false
+        type: string
+        default: '/health'
+      working_directory:
+        description: 'Working directory for Go build (for monorepo)'
+        required: false
+        type: string
+        default: '.'
+    secrets:
+      SERVER_USER:
+        description: 'SSH username'
+        required: true
+      SERVER_IP:
+        description: 'Server IP address'
+        required: true
+      SERVER_SSH_PASSWORD:
+        description: 'SSH password'
+        required: true
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    env:
+      SERVICE_NAME: ${{ github.event.repository.name }}
+      APP_PORT: ${{ inputs.app_port }}
+      GRPC_PORT: ${{ inputs.grpc_port }}
+      ENV_FILE: ${{ inputs.env_file }}
+      ADDITIONAL_VOLUMES: ${{ inputs.additional_volumes }}
+      DOCKER_NETWORK: ${{ inputs.docker_network }}
+      HEALTH_ENDPOINT: ${{ inputs.health_endpoint }}
+      WORKING_DIR: ${{ inputs.working_directory }}
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      SERVER_USER: ${{ secrets.SERVER_USER }}
+      SERVER_IP: ${{ secrets.SERVER_IP }}
+      SERVER_SSH_PASSWORD: ${{ secrets.SERVER_SSH_PASSWORD }}
+
+    steps:
+      - name: Set short SHA and downcase REPO
+        run: |
+          SHORT_SHA=$(echo ${{ github.sha }} | cut -c1-8)
+          REPO_LOWER=$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')
+          echo "SHORT_SHA=${SHORT_SHA}" >> ${GITHUB_ENV}
+          echo "DOCKER_IMAGE=ghcr.io/${REPO_LOWER}:${SHORT_SHA}" >> ${GITHUB_ENV}
+
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go ${{ inputs.go_version }}
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ inputs.go_version }}
+          cache-dependency-path: ${{ inputs.working_directory }}/go.sum
+
+      - name: Cache Go modules
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/go/pkg/mod
+            ~/.cache/go-build
+          key: ${{ runner.os }}-go-${{ hashFiles(format('{0}/go.sum', inputs.working_directory)) }}
+          restore-keys: |
+            ${{ runner.os }}-go-
+
+      - name: Verify Go installation
+        run: go version
+
+      - name: Download dependencies
+        working-directory: ${{ inputs.working_directory }}
+        run: go mod download
+
+      - name: Run tests
+        working-directory: ${{ inputs.working_directory }}
+        run: go test -v ./... || true
+
+      - name: Build Go binary
+        working-directory: ${{ inputs.working_directory }}
+        run: |
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="-w -s" -o app ./cmd/main.go
+
+      - name: Build Docker image
+        working-directory: ${{ inputs.working_directory }}
+        run: |
+          docker build -t ${{ env.DOCKER_IMAGE }} .
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ env.GITHUB_TOKEN }}
+
+      - name: Push Docker image to GHCR
+        run: |
+          docker push ${{ env.DOCKER_IMAGE }}
+
+      - name: Deploy to Server
+        run: |
+          sudo apt-get install -y sshpass
+          mkdir -p ~/.ssh
+          ssh-keyscan -H ${{ env.SERVER_IP }} >> ~/.ssh/known_hosts
+
+          sshpass -p ${{ env.SERVER_SSH_PASSWORD }} ssh ${{ env.SERVER_USER }}@${{ env.SERVER_IP }} << 'EOF'
+            echo ${{ env.GITHUB_TOKEN }} | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+
+            if [ -n "${{ env.DOCKER_NETWORK }}" ]; then
+              docker network create --driver bridge ${{ env.DOCKER_NETWORK }} || true
+            fi
+
+            docker pull ${{ env.DOCKER_IMAGE }}
+            docker stop ${{ env.SERVICE_NAME }} || true
+            docker rm ${{ env.SERVICE_NAME }} || true
+
+            NETWORK_PARAM=""
+            if [ -n "${{ env.DOCKER_NETWORK }}" ]; then
+              NETWORK_PARAM="--network ${{ env.DOCKER_NETWORK }}"
+            fi
+
+            ENV_PARAM=""
+            if [ -n "${{ env.ENV_FILE }}" ]; then
+              ENV_PARAM="--env-file ${{ env.ENV_FILE }}"
+            fi
+
+            PORT_PARAM="-p ${{ env.APP_PORT }}:${{ env.APP_PORT }}"
+            if [ -n "${{ env.GRPC_PORT }}" ]; then
+              PORT_PARAM="$PORT_PARAM -p ${{ env.GRPC_PORT }}:${{ env.GRPC_PORT }}"
+            fi
+
+            docker run -d \
+              --name ${{ env.SERVICE_NAME }} \
+              --restart unless-stopped \
+              $NETWORK_PARAM \
+              $ENV_PARAM \
+              $PORT_PARAM \
+              ${{ env.ADDITIONAL_VOLUMES }} \
+              ${{ env.DOCKER_IMAGE }}
+          EOF
+
+      - name: Verify deployment
+        run: |
+          sleep 10
+          MAX_RETRIES=24
+          RETRY_INTERVAL=5
+
+          for i in $(seq 1 $MAX_RETRIES); do
+            echo "Health check attempt $i/$MAX_RETRIES..."
+            HTTP_STATUS=$(sshpass -p ${{ env.SERVER_SSH_PASSWORD }} ssh ${{ env.SERVER_USER }}@${{ env.SERVER_IP }} \
+              "curl -s -o /dev/null -w '%{http_code}' http://localhost:${{ env.APP_PORT }}${{ env.HEALTH_ENDPOINT }}" 2>/dev/null || echo "000")
+
+            if [ "$HTTP_STATUS" = "200" ]; then
+              echo "Health check passed! Service is running."
+              exit 0
+            fi
+            echo "Health check returned status: $HTTP_STATUS. Retrying in ${RETRY_INTERVAL}s..."
+            sleep $RETRY_INTERVAL
+          done
+
+          echo "Health check failed after $MAX_RETRIES attempts"
+          echo "Container logs:"
+          sshpass -p ${{ env.SERVER_SSH_PASSWORD }} ssh ${{ env.SERVER_USER }}@${{ env.SERVER_IP }} \
+            "docker logs --tail 100 ${{ env.SERVICE_NAME }}"
+          exit 1
